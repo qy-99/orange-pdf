@@ -1,0 +1,6 @@
+{
+  "name": "orange PDF",
+  "description": "Private, Offline PDF Workspace. Your files never leave this device. Split, organize, compress, watermark, page-number, encrypt, and convert PDFs client-side.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

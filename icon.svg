@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="112" fill="#0f172a"/>
+  <!-- Subtle inner gradient glow -->
+  <rect x="24" y="24" width="464" height="464" rx="96" fill="url(#bg-gradient)" stroke="#334155" stroke-width="2"/>
+  
+  <!-- Document Sheet -->
+  <g filter="url(#shadow)">
+    <path d="M148 104 C148 95.163 155.163 88 164 88 H286 L364 166 V408 C364 416.837 356.837 424 348 424 H164 C155.163 424 148 416.837 148 408 Z" fill="#ffffff"/>
+    <path d="M286 88 V150 C286 158.837 293.163 166 302 166 H364 Z" fill="#e2e8f0"/>
+  </g>
+
+  <!-- Orange Brand Accent Ribbon -->
+  <rect x="124" y="236" width="264" height="88" rx="18" fill="url(#orange-grad)"/>
+  
+  <!-- Text inside ribbon -->
+  <text x="256" y="295" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="52" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">orange PDF</text>
+
+  <!-- Privacy lock dot indicator -->
+  <circle cx="256" cy="372" r="14" fill="#f97316"/>
+  <circle cx="256" cy="372" r="6" fill="#ffffff"/>
+
+  <defs>
+    <linearGradient id="bg-gradient" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="orange-grad" x1="124" y1="236" x2="388" y2="324" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ea580c"/>
+      <stop offset="1" stop-color="#f97316"/>
+    </linearGradient>
+    <filter id="shadow" x="136" y="80" width="240" height="360" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+</svg>
