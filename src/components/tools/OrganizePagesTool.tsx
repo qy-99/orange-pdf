@@ -197,6 +197,8 @@ export const OrganizePagesTool: React.FC<OrganizePagesToolProps> = ({
   const [redoStack, setRedoStack] = useState<PageRef[][]>([]);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
+  const draggedPageIdRef = useRef<string | null>(null);
+  const hasDraggedRef = useRef<boolean>(false);
   const touchDragIdRef = useRef<string | null>(null);
   const [touchDragId, setTouchDragId] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -257,14 +259,34 @@ export const OrganizePagesTool: React.FC<OrganizePagesToolProps> = ({
   const reorderPages = useCallback((fromId: string, toId: string) => {
     if (!fromId || !toId || fromId === toId) return;
     const current = pageOrderRef.current;
-    const from = current.findIndex((page) => page.id === fromId);
-    const to = current.findIndex((page) => page.id === toId);
-    if (from < 0 || to < 0) return;
+    const fromIndex = current.findIndex((page) => page.id === fromId);
+    const toIndex = current.findIndex((page) => page.id === toId);
+    if (fromIndex < 0 || toIndex < 0) return;
+
+    if (selectedPages.has(fromId) && selectedPages.size > 1) {
+      if (selectedPages.has(toId)) {
+        const next = [...current];
+        const [moved] = next.splice(fromIndex, 1);
+        next.splice(toIndex, 0, moved);
+        recordPageChange(next);
+        return;
+      }
+      const selected = current.filter((page) => selectedPages.has(page.id));
+      const remaining = current.filter((page) => !selectedPages.has(page.id));
+      const targetInRemaining = remaining.findIndex((page) => page.id === toId);
+      if (targetInRemaining >= 0) {
+        const insertIdx = fromIndex < toIndex ? targetInRemaining + 1 : targetInRemaining;
+        remaining.splice(insertIdx, 0, ...selected);
+        recordPageChange(remaining);
+        return;
+      }
+    }
+
     const next = [...current];
-    const [moved] = next.splice(from, 1);
-    next.splice(to, 0, moved);
+    const [moved] = next.splice(fromIndex, 1);
+    next.splice(toIndex, 0, moved);
     recordPageChange(next);
-  }, [recordPageChange]);
+  }, [recordPageChange, selectedPages]);
 
   // Pointer-based dragging adds a touch-friendly path for installed mobile PWAs;
   // desktop mouse dragging uses the native drag-and-drop events below.
@@ -273,22 +295,32 @@ export const OrganizePagesTool: React.FC<OrganizePagesToolProps> = ({
     const onPointerMove = (event: PointerEvent) => {
       const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-page-id]');
       const nextId = target?.dataset.pageId ?? null;
-      setDragOverId((current) => current === nextId ? current : nextId);
+      if (nextId && nextId !== touchDragIdRef.current) {
+        setDragOverId(nextId);
+      }
     };
     const onPointerUp = (event: PointerEvent) => {
       const sourceId = touchDragIdRef.current;
       const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-page-id]')?.dataset.pageId;
-      if (sourceId && target) reorderPages(sourceId, target);
+      if (sourceId && target && sourceId !== target) {
+        reorderPages(sourceId, target);
+      }
       touchDragIdRef.current = null;
       setTouchDragId(null);
       setDraggingId(null);
       setDragOverId(null);
+      setTimeout(() => {
+        hasDraggedRef.current = false;
+      }, 100);
     };
     const onPointerCancel = () => {
       touchDragIdRef.current = null;
       setTouchDragId(null);
       setDraggingId(null);
       setDragOverId(null);
+      setTimeout(() => {
+        hasDraggedRef.current = false;
+      }, 100);
     };
     window.addEventListener('pointermove', onPointerMove, { passive: true });
     window.addEventListener('pointerup', onPointerUp, { passive: true });
@@ -651,65 +683,159 @@ export const OrganizePagesTool: React.FC<OrganizePagesToolProps> = ({
                 <article
                   key={page.id}
                   data-page-id={page.id}
-                  onClick={() => toggleSelected(page.id)}
-                  onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDragOverId(page.id); }}
-                  onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragOverId((id) => id === page.id ? null : id); }}
-                  onDrop={(event) => {
-                    event.preventDefault();
-                    const fromId = event.dataTransfer.getData('text/plain') || draggingId;
-                    if (fromId) reorderPages(fromId, page.id);
+                  draggable={!isProcessing}
+                  onClick={() => {
+                    if (hasDraggedRef.current) {
+                      hasDraggedRef.current = false;
+                      return;
+                    }
+                    toggleSelected(page.id);
+                  }}
+                  onDragStart={(event) => {
+                    if (isProcessing) return;
+                    hasDraggedRef.current = true;
+                    draggedPageIdRef.current = page.id;
+                    setDraggingId(page.id);
+                    setDragOverId(null);
+                    event.dataTransfer.effectAllowed = 'move';
+                    event.dataTransfer.setData('text/plain', page.id);
+                    try {
+                      event.dataTransfer.setData('application/x-page-id', page.id);
+                    } catch {
+                      // ignore
+                    }
+                  }}
+                  onDragEnd={() => {
+                    draggedPageIdRef.current = null;
                     setDraggingId(null);
                     setDragOverId(null);
+                    setTimeout(() => {
+                      hasDraggedRef.current = false;
+                    }, 100);
+                  }}
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = 'move';
+                    if (dragOverId !== page.id) setDragOverId(page.id);
+                  }}
+                  onDragEnter={(event) => {
+                    event.preventDefault();
+                    setDragOverId(page.id);
+                  }}
+                  onDragLeave={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                      setDragOverId((id) => (id === page.id ? null : id));
+                    }
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const fromId =
+                      draggedPageIdRef.current ||
+                      event.dataTransfer.getData('application/x-page-id') ||
+                      event.dataTransfer.getData('text/plain');
+                    if (fromId && fromId !== page.id) {
+                      reorderPages(fromId, page.id);
+                    }
+                    draggedPageIdRef.current = null;
+                    setDraggingId(null);
+                    setDragOverId(null);
+                    setTimeout(() => {
+                      hasDraggedRef.current = false;
+                    }, 100);
                   }}
                   style={{ borderLeftColor: color.hex, borderLeftWidth: 5 }}
-                  className={`group relative min-w-0 overflow-hidden rounded-xl border border-slate-800 bg-slate-900/80 p-2.5 shadow-sm transition-all ${isSelected ? 'ring-2 ring-orange-500/70 bg-orange-500/[0.07]' : 'hover:border-slate-700'} ${isDragging ? 'scale-[0.98] opacity-45' : ''} ${isDragOver ? 'ring-2 ring-sky-400/80 -translate-y-0.5' : ''}`}
+                  className={`group relative min-w-0 overflow-hidden rounded-xl border p-2.5 shadow-sm transition-all select-none cursor-grab active:cursor-grabbing ${
+                    isSelected
+                      ? 'ring-2 ring-amber-500/80 bg-amber-500/[0.08] border-amber-500/50'
+                      : 'border-slate-800 bg-slate-900/80 hover:border-slate-700'
+                  } ${isDragging ? 'opacity-35 scale-[0.97] border-dashed border-amber-400 pointer-events-none' : ''} ${
+                    isDragOver ? 'ring-2 ring-amber-400 bg-amber-500/20 -translate-y-1 shadow-lg shadow-amber-500/25' : ''
+                  }`}
                 >
-                  <div className="mb-2 flex items-center justify-between gap-1.5">
+                  <div className="mb-2 flex items-center justify-between gap-1.5 pointer-events-none">
                     <span className="rounded-md bg-slate-800 px-2 py-1 text-[11px] font-bold tabular-nums text-white">#{index + 1}</span>
                     <div className="flex min-w-0 items-center gap-1">
                       <span className="max-w-[70px] truncate rounded-md px-1.5 py-1 text-[9px] font-semibold" style={{ color: color.hex, backgroundColor: `${color.hex}18` }} title={file.name}>{file.name.replace(/\.pdf$/i, '')}</span>
-                      <button
-                        type="button"
-                        draggable
-                        onClick={(event) => event.stopPropagation()}
-                        onDragStart={(event) => {
-                          event.dataTransfer.effectAllowed = 'move';
-                          event.dataTransfer.setData('text/plain', page.id);
-                          setDraggingId(page.id);
-                          setDragOverId(null);
-                        }}
-                        onDragEnd={() => { setDraggingId(null); setDragOverId(null); }}
+                      <div
                         onPointerDown={(event) => {
                           if (event.pointerType === 'mouse') return;
                           event.preventDefault();
+                          hasDraggedRef.current = true;
                           touchDragIdRef.current = page.id;
                           setTouchDragId(page.id);
                           setDraggingId(page.id);
                         }}
-                        className="shrink-0 touch-none rounded-md p-1 text-slate-400 hover:bg-slate-800 hover:text-white active:text-orange-300"
-                        title="Drag to move this page"
-                        aria-label={`Drag page ${index + 1} to reorder`}
-                      ><GripVertical className="h-4 w-4" /></button>
+                        className="shrink-0 rounded-md p-1 text-slate-400 hover:text-white cursor-grab active:cursor-grabbing pointer-events-auto"
+                        title="Drag to reorder"
+                      >
+                        <GripVertical className="h-4 w-4" />
+                      </div>
                     </div>
                   </div>
 
-                  <LazyThumbnail file={file} pageNumber={page.pageNumber} rotation={page.rotation} />
+                  <div className="pointer-events-none select-none">
+                    <LazyThumbnail file={file} pageNumber={page.pageNumber} rotation={page.rotation} />
+                  </div>
 
                   <div className="mt-2 flex items-start justify-between gap-2">
-                    <div className="min-w-0">
+                    <div className="min-w-0 pointer-events-none select-none">
                       <div className="text-xs font-semibold text-slate-200">Original page {page.pageNumber}</div>
                       <div className="mt-0.5 truncate text-[10px] text-slate-500" title={file.name}>{file.name}</div>
-                      {page.rotation !== 0 && <div className="mt-1 text-[10px] text-orange-300">Rotated {page.rotation}°</div>}
+                      {page.rotation !== 0 && <div className="mt-1 text-[10px] text-amber-300">Rotated {page.rotation}°</div>}
                     </div>
-                    <button onClick={(event) => { event.stopPropagation(); getBytes(file).then((bytes) => onPreviewPage?.(bytes, page.pageNumber, file.name)).catch((error) => setErrorMessage(error instanceof Error ? error.message : 'Could not open this page preview.')); }} className="shrink-0 rounded-lg border border-slate-700 bg-slate-800 p-1.5 text-slate-400 transition hover:text-orange-300" title="Preview full page" aria-label={`Preview ${file.name}, page ${page.pageNumber}`}>
+                    <button
+                      type="button"
+                      onMouseDown={(event) => event.stopPropagation()}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        getBytes(file)
+                          .then((bytes) => onPreviewPage?.(bytes, page.pageNumber, file.name))
+                          .catch((error) => setErrorMessage(error instanceof Error ? error.message : 'Could not open this page preview.'));
+                      }}
+                      className="shrink-0 rounded-lg border border-slate-700 bg-slate-800 p-1.5 text-slate-400 transition hover:text-amber-300 hover:border-amber-500/50"
+                      title="Preview full page"
+                      aria-label={`Preview ${file.name}, page ${page.pageNumber}`}
+                    >
                       <Eye className="h-3.5 w-3.5" />
                     </button>
                   </div>
 
-                  <div className="mt-2 flex items-center justify-between border-t border-slate-800 pt-1.5" onClick={(event) => event.stopPropagation()}>
-                    <button type="button" disabled={index === 0 || isProcessing} onClick={() => handleMoveByButton(index, -1)} className="rounded-md p-1.5 text-slate-500 transition hover:bg-slate-800 hover:text-slate-100 disabled:opacity-20" title="Move one position left/up" aria-label={`Move page ${index + 1} earlier`}><ArrowLeft className="h-3.5 w-3.5" /></button>
-                    <button type="button" disabled={isProcessing} onClick={() => recordPageChange(pageOrder.filter((item) => item.id !== page.id))} className="rounded-md p-1.5 text-slate-500 transition hover:bg-red-500/10 hover:text-red-300 disabled:opacity-30" title="Remove page from output" aria-label={`Remove page ${index + 1}`}><Trash2 className="h-3.5 w-3.5" /></button>
-                    <button type="button" disabled={index === pageOrder.length - 1 || isProcessing} onClick={() => handleMoveByButton(index, 1)} className="rounded-md p-1.5 text-slate-500 transition hover:bg-slate-800 hover:text-slate-100 disabled:opacity-20" title="Move one position right/down" aria-label={`Move page ${index + 1} later`}><ArrowRight className="h-3.5 w-3.5" /></button>
+                  <div
+                    className="mt-2 flex items-center justify-between border-t border-slate-800 pt-1.5"
+                    onMouseDown={(event) => event.stopPropagation()}
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <button
+                      type="button"
+                      disabled={index === 0 || isProcessing}
+                      onClick={() => handleMoveByButton(index, -1)}
+                      className="rounded-md p-1.5 text-slate-500 transition hover:bg-slate-800 hover:text-slate-100 disabled:opacity-20"
+                      title="Move one position left"
+                      aria-label={`Move page ${index + 1} earlier`}
+                    >
+                      <ArrowLeft className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isProcessing}
+                      onClick={() => recordPageChange(pageOrder.filter((item) => item.id !== page.id))}
+                      className="rounded-md p-1.5 text-slate-500 transition hover:bg-red-500/10 hover:text-red-300 disabled:opacity-30"
+                      title="Remove page"
+                      aria-label={`Remove page ${index + 1}`}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      disabled={index === pageOrder.length - 1 || isProcessing}
+                      onClick={() => handleMoveByButton(index, 1)}
+                      className="rounded-md p-1.5 text-slate-500 transition hover:bg-slate-800 hover:text-slate-100 disabled:opacity-20"
+                      title="Move one position right"
+                      aria-label={`Move page ${index + 1} later`}
+                    >
+                      <ArrowRight className="h-3.5 w-3.5" />
+                    </button>
                   </div>
                 </article>
               );
@@ -717,11 +843,6 @@ export const OrganizePagesTool: React.FC<OrganizePagesToolProps> = ({
           </div>
         </div>
       )}
-
-      <div className="flex items-start gap-2 rounded-xl border border-slate-800 bg-slate-900/40 p-3 text-[11px] leading-relaxed text-slate-500">
-        <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
-        <p>Processing happens locally in your browser. Large or complex PDFs can require substantial memory. For very large files, organize in smaller batches. Encrypted or damaged PDFs may need to be unlocked or repaired before editing.</p>
-      </div>
     </div>
   );
 };

@@ -6,7 +6,6 @@
 import React, { useState, useCallback } from 'react';
 import type { ToolId, QueuedFile } from './types';
 import { Header } from './components/Header';
-import { TrustBanner } from './components/TrustBanner';
 import { DropZone } from './components/DropZone';
 import { FileQueue } from './components/FileQueue';
 import { ToolNavigation } from './components/ToolNavigation';
@@ -19,7 +18,6 @@ import { WatermarkTool } from './components/tools/WatermarkTool';
 import { PageNumbersTool } from './components/tools/PageNumbersTool';
 import { PasswordProtectTool } from './components/tools/PasswordProtectTool';
 import { PreviewModal } from './components/PreviewModal';
-import { OfflineIndicator } from './components/OfflineIndicator';
 import { getPdfPageCount } from './utils/pdfHelper';
 
 export default function App() {
@@ -138,7 +136,7 @@ export default function App() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-orange-500/30 selection:text-orange-200">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-amber-500/30 selection:text-amber-200">
       {/* Header */}
       <Header
         hasFiles={files.length > 0}
@@ -148,9 +146,6 @@ export default function App() {
 
       {/* Main Workspace */}
       <main className="flex-1 mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 space-y-6">
-        {/* Trust Guarantee Banner */}
-        <TrustBanner />
-
         {/* Drop Zone & File Queue */}
         <section aria-label="File Upload & Queue" className="space-y-4">
           <DropZone
@@ -243,15 +238,13 @@ export default function App() {
       </main>
 
       {/* Footer */}
-      <footer className="mt-auto border-t border-slate-900 bg-slate-950 py-6 text-center text-xs text-slate-500">
-        <div className="mx-auto max-w-7xl px-4 flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
-            <span className="font-semibold text-slate-300">orange PDF</span>
-            <span>—</span>
-            <span>Private, Offline PDF Workspace</span>
+      <footer className="mt-auto border-t border-slate-900 bg-slate-950 py-5 text-center text-xs text-slate-500">
+        <div className="mx-auto max-w-7xl px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
+          <div className="flex items-center gap-2 font-medium text-slate-400">
+            <span>orange PDF</span>
           </div>
-          <div className="text-[11px] text-slate-500">
-            100% Client-Side In-Memory Processing • No accounts • No cloud telemetry
+          <div className="text-[11px] text-slate-600">
+            Client-side PDF workspace
           </div>
         </div>
       </footer>
@@ -264,9 +257,6 @@ export default function App() {
         pageNum={previewState.pageNum}
         title={previewState.title}
       />
-
-      {/* Offline Status Toast */}
-      <OfflineIndicator />
     </div>
   );
 }

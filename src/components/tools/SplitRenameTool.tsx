@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
 import JSZip from 'jszip';
 import {
@@ -20,16 +20,24 @@ import {
   Search,
   Eye,
   Edit2,
-  Sparkles,
-  Info,
   Loader2,
   ScanText,
+  ChevronDown,
+  ChevronUp,
+  FileCheck,
+  ArrowRight,
+  Sliders,
 } from 'lucide-react';
 import type { QueuedFile, DrawingRow } from '../../types';
 import {
   DEFAULT_PATTERN,
   PATTERN_PRESETS,
+  isReservedFilename,
+  cleanOutputFilename,
+  createManualRowsForPageCount,
+  buildFilename,
   evaluateRows,
+  validateRowsForExport,
   parseDelimitedText,
   formatListNo,
   sanitizeFilename,
@@ -41,7 +49,7 @@ import { downloadFile, extractPdfPageTexts, renderPageThumbnail, renderPageToCan
 interface SplitRenameToolProps {
   files: QueuedFile[];
   activeFileId: string | null;
-  onPreviewPdfPage?: (fileBytes: Uint8Array, pageNum: number) => void;
+  onPreviewPdfPage?: (fileBytes: Uint8Array, pageNum: number, title?: string) => void;
 }
 
 export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
@@ -64,15 +72,21 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
     [pdfFiles, selectedPdfId]
   );
 
+  const totalPdfPages = selectedPdf?.pageCount || 0;
+
+  // Mode: default is 'manual' per requirements
+  const [mode, setMode] = useState<'manual' | 'drawing-list'>('manual');
+
   // Drawing rows state
   const [rows, setRows] = useState<DrawingRow[]>([]);
   const [pattern, setPattern] = useState<string>(DEFAULT_PATTERN);
   const [startPageOffset, setStartPageOffset] = useState<number>(1);
-  const [activeTab, setActiveTab] = useState<'upload' | 'paste' | 'pdf-extract' | 'ocr'>('upload');
+
+  // Optional drawing-list panel visibility
+  const [showImportPanel, setShowImportPanel] = useState<boolean>(false);
+  const [activeImportTab, setActiveImportTab] = useState<'upload' | 'paste' | 'pdf-extract' | 'ocr'>('upload');
   const [pastedText, setPastedText] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [editingRowId, setEditingRowId] = useState<string | null>(null);
-  const [editFilenameVal, setEditFilenameVal] = useState<string>('');
 
   // Processing state
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
@@ -84,14 +98,300 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
   const [ocrLoading, setOcrLoading] = useState<boolean>(false);
   const [thumbnailCache, setThumbnailCache] = useState<Record<number, string>>({});
 
-  const totalPdfPages = selectedPdf?.pageCount || 0;
+  // Input refs to auto-focus missing fields on export error
+  const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+
+  // Track the ID and page count of the PDF for which rows were generated in manual mode
+  const lastGeneratedKeyRef = useRef<string>('');
+
+  // Automatically generate one row per page when in manual mode
+  useEffect(() => {
+    if (mode === 'manual' && selectedPdfId && totalPdfPages > 0) {
+      const key = `${selectedPdfId}:${totalPdfPages}`;
+      if (lastGeneratedKeyRef.current !== key) {
+        lastGeneratedKeyRef.current = key;
+        setRows(createManualRowsForPageCount(totalPdfPages));
+      }
+    }
+  }, [mode, selectedPdfId, totalPdfPages]);
 
   // Evaluate rows live against pattern and PDF page count
   const { rows: evaluatedRows, counters } = useMemo(() => {
-    return evaluateRows(rows, pattern, totalPdfPages);
-  }, [rows, pattern, totalPdfPages]);
+    return evaluateRows(rows, pattern, totalPdfPages, mode);
+  }, [rows, pattern, totalPdfPages, mode]);
 
-  // Load sample drawing list (21 items from specification)
+  // Handle switching back to manual filenames
+  const handleSwitchToManual = () => {
+    if (
+      rows.length > 0 &&
+      !window.confirm(
+        'Switch to manual filename entry? This will replace the imported drawing list with blank filename rows for each page of the current PDF.'
+      )
+    ) {
+      return;
+    }
+    setMode('manual');
+    lastGeneratedKeyRef.current = `${selectedPdfId}:${totalPdfPages}`;
+    setRows(createManualRowsForPageCount(totalPdfPages));
+    setShowImportPanel(false);
+  };
+
+  // Row update handlers
+  const handleToggleRow = (id: string) => {
+    setRows((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, isIncluded: !r.isIncluded } : r))
+    );
+  };
+
+  const handleSelectAll = (checked: boolean) => {
+    setRows((prev) => prev.map((r) => ({ ...r, isIncluded: checked })));
+  };
+
+  const handleUpdateFilename = (id: string, value: string) => {
+    setRows((prev) =>
+      prev.map((r) =>
+        r.id === id
+          ? {
+              ...r,
+              manualFilename: value,
+              isManuallyEdited: true,
+            }
+          : r
+      )
+    );
+  };
+
+  const handleUpdateField = (id: string, field: keyof DrawingRow, val: any) => {
+    setRows((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, [field]: val } : r))
+    );
+  };
+
+  // Adjust start page offset in drawing-list mode
+  const handleUpdateStartPage = (newOffset: number) => {
+    setStartPageOffset(newOffset);
+    setRows((prev) =>
+      prev.map((r, i) => ({
+        ...r,
+        sourcePage: i + newOffset,
+      }))
+    );
+  };
+
+  // Parse Excel / CSV file
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const workbook = XLSX.read(buffer, { type: 'array' });
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rawData = XLSX.utils.sheet_to_json<any[]>(firstSheet, { header: 1 });
+
+      if (rawData.length === 0) {
+        alert('The uploaded file contains no data rows.');
+        return;
+      }
+
+      // Find header row or infer columns
+      let colNo = 0;
+      let colDwg = 1;
+      let colRev = 2;
+      let colTitle = 3;
+      let startRowIdx = 0;
+
+      const firstRow = rawData[0] || [];
+      const isHeader = firstRow.some((c: any) =>
+        /no\.?|drawing|number|rev|revision|title|sheet/i.test(String(c || ''))
+      );
+
+      if (isHeader) {
+        startRowIdx = 1;
+        firstRow.forEach((col: any, idx: number) => {
+          const lower = String(col || '').toLowerCase().trim();
+          if (/title|description/i.test(lower)) {
+            colTitle = idx;
+          } else if (/rev|revision/i.test(lower)) {
+            colRev = idx;
+          } else if (/^no\.?$|^item|^item\s*no|^#$|^list\s*no/i.test(lower)) {
+            colNo = idx;
+          } else if (/drawing|dwg|number|sheet/i.test(lower)) {
+            colDwg = idx;
+          }
+        });
+      }
+
+      const parsed: DrawingRow[] = [];
+      let rowCounter = 1;
+
+      for (let i = startRowIdx; i < rawData.length; i++) {
+        const row = rawData[i];
+        if (!row || row.length === 0) continue;
+
+        const listNo = String(row[colNo] !== undefined ? row[colNo] : rowCounter);
+        const drawingNo = String(row[colDwg] || '').trim();
+        const revision = String(row[colRev] || '').trim();
+        const title = String(row[colTitle] || '').trim();
+
+        if (drawingNo || listNo) {
+          parsed.push({
+            id: `row-${rowCounter}`,
+            listNo,
+            drawingNo,
+            revision,
+            title,
+            sourcePage: rowCounter + startPageOffset - 1,
+            isIncluded: true,
+            isManuallyEdited: false,
+            matchStatus: 'matched',
+            warnings: [],
+          });
+          rowCounter++;
+        }
+      }
+
+      if (parsed.length > 0) {
+        setRows(parsed);
+        setMode('drawing-list');
+        setShowImportPanel(false);
+      } else {
+        alert('Could not detect drawing rows in the uploaded spreadsheet. Your current table remains intact.');
+      }
+    } catch (err: any) {
+      alert(`Failed to parse file: ${err.message}. Your current table remains intact.`);
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  // Apply pasted table text
+  const handleApplyPastedText = () => {
+    if (!pastedText.trim()) return;
+    const parsed = parseDelimitedText(pastedText);
+    if (parsed.length === 0) {
+      alert('Could not detect drawing rows from the pasted text. Your current table remains intact.');
+      return;
+    }
+
+    const newRows: DrawingRow[] = parsed.map((item, idx) => ({
+      id: `row-${idx + 1}`,
+      listNo: item.listNo,
+      drawingNo: item.drawingNo,
+      revision: item.revision,
+      title: item.title,
+      sourcePage: idx + startPageOffset,
+      isIncluded: true,
+      isManuallyEdited: false,
+      matchStatus: 'matched',
+      warnings: [],
+    }));
+
+    setRows(newRows);
+    setMode('drawing-list');
+    setShowImportPanel(false);
+  };
+
+  // Extract from selectable PDF text
+  const handleExtractFromPdf = async () => {
+    if (!selectedPdf) {
+      alert('Please select a PDF document first.');
+      return;
+    }
+    setIsProcessing(true);
+    try {
+      const fileBytes = selectedPdf.data || new Uint8Array(await selectedPdf.file.arrayBuffer());
+      const pageTexts = await extractPdfPageTexts(fileBytes);
+
+      const parsed: DrawingRow[] = [];
+      let rowIdx = 1;
+
+      pageTexts.forEach((text, pageNum) => {
+        const lines = text.split('\n');
+        lines.forEach((line) => {
+          const match = line.match(/([A-Z0-9\-_]{5,35})\s+([A-Z0-9]{1,3})/);
+          if (match) {
+            parsed.push({
+              id: `row-${rowIdx++}`,
+              listNo: String(rowIdx),
+              drawingNo: match[1],
+              revision: match[2],
+              title: line.replace(match[0], '').trim(),
+              sourcePage: pageNum + 1,
+              isIncluded: true,
+              isManuallyEdited: false,
+              matchStatus: 'matched',
+              warnings: [],
+            });
+          }
+        });
+      });
+
+      if (parsed.length > 0) {
+        setRows(parsed);
+        setMode('drawing-list');
+        setShowImportPanel(false);
+      } else {
+        alert(
+          'No tabular drawing numbers detected in selectable PDF text. You can use the Paste Table or Upload Excel tab, or enter filenames directly.'
+        );
+      }
+    } catch (err: any) {
+      alert(`Notice while scanning PDF text: ${err.message}. Your current table remains intact.`);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // Local OCR via Tesseract.js
+  const handleRunOcr = async () => {
+    if (!selectedPdf) {
+      alert('Please select a PDF first.');
+      return;
+    }
+    setOcrLoading(true);
+    try {
+      const { createWorker } = await import('tesseract.js');
+      const worker = await createWorker('eng');
+
+      const fileBytes = selectedPdf.data || new Uint8Array(await selectedPdf.file.arrayBuffer());
+      const canvas = await renderPageToCanvas(fileBytes, 1, 1.5);
+
+      const ret = await worker.recognize(canvas);
+      await worker.terminate();
+
+      if (ret.data.text) {
+        const parsed = parseDelimitedText(ret.data.text);
+        if (parsed.length > 0) {
+          const newRows: DrawingRow[] = parsed.map((item, idx) => ({
+            id: `row-${idx + 1}`,
+            listNo: item.listNo,
+            drawingNo: item.drawingNo,
+            revision: item.revision,
+            title: item.title,
+            sourcePage: idx + startPageOffset,
+            isIncluded: true,
+            isManuallyEdited: false,
+            matchStatus: 'matched',
+            warnings: ['Parsed via client-side OCR; please review fields carefully'],
+          }));
+          setRows(newRows);
+          setMode('drawing-list');
+          setShowImportPanel(false);
+        } else {
+          setPastedText(ret.data.text);
+          setActiveImportTab('paste');
+          alert('OCR recognized text from Page 1! Review and edit the recognized table lines below.');
+        }
+      }
+    } catch (err: any) {
+      alert(`Client-side OCR notice: ${err.message}. Your current table remains intact.`);
+    } finally {
+      setOcrLoading(false);
+    }
+  };
+
+  // Optional: Load sample package demo
   const handleLoadSample = () => {
     const sampleItems = [
       { listNo: '01', drawingNo: 'CR115-SKSPL-CR10-B2-S-STR-DR-ZZZ-8720', revision: 'A', title: 'CONCOURSE B2 LEVEL PERMANENT STRUCTURE DRAWING LIST ENTRANCE 1' },
@@ -131,304 +431,45 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
     }));
 
     setRows(newRows);
-  };
-
-  // Parse Excel / CSV file
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    try {
-      const buffer = await file.arrayBuffer();
-      const workbook = XLSX.read(buffer, { type: 'array' });
-      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-      const rawData = XLSX.utils.sheet_to_json<any[]>(firstSheet, { header: 1 });
-
-      if (rawData.length === 0) {
-        alert('The uploaded file contains no data rows.');
-        return;
-      }
-
-      // Find header row or infer columns
-      let colNo = 0;
-      let colDwg = 1;
-      let colRev = 2;
-      let colTitle = 3;
-      let startRowIdx = 0;
-
-      const firstRow = rawData[0] || [];
-      const isHeader = firstRow.some((c: any) =>
-        /no\.?|drawing|dwg|rev|revision|title|sheet/i.test(String(c))
-      );
-
-      if (isHeader) {
-        startRowIdx = 1;
-        firstRow.forEach((col: any, idx: number) => {
-          const str = String(col || '').toLowerCase().trim();
-          if (/title|description/i.test(str)) colTitle = idx;
-          else if (/rev|revision/i.test(str)) colRev = idx;
-          else if (/^no\.?$|^item|^item\s*no|^#$|^list\s*no/i.test(str)) colNo = idx;
-          else if (/drawing|dwg|number|sheet/i.test(str)) colDwg = idx;
-        });
-      }
-
-      const parsedRows: DrawingRow[] = [];
-      let pageCounter = startPageOffset;
-
-      for (let i = startRowIdx; i < rawData.length; i++) {
-        const row = rawData[i];
-        if (!row || row.length === 0) continue;
-
-        const listNo = String(row[colNo] ?? i - startRowIdx + 1).trim();
-        const drawingNo = String(row[colDwg] ?? '').trim();
-        const revision = String(row[colRev] ?? '').trim();
-        const title = String(row[colTitle] ?? '').trim();
-
-        if (drawingNo || listNo) {
-          parsedRows.push({
-            id: `row-${parsedRows.length + 1}`,
-            listNo,
-            drawingNo,
-            revision,
-            title,
-            sourcePage: pageCounter++,
-            isIncluded: true,
-            isManuallyEdited: false,
-            matchStatus: 'matched',
-            warnings: [],
-          });
-        }
-      }
-
-      setRows(parsedRows);
-    } catch (err: any) {
-      alert(`Failed to parse drawing list: ${err.message}`);
-    }
-  };
-
-  // Parse pasted table text
-  const handleApplyPastedText = () => {
-    if (!pastedText.trim()) return;
-    const parsed = parseDelimitedText(pastedText);
-    if (parsed.length === 0) {
-      alert('Could not detect any rows from the pasted text.');
-      return;
-    }
-
-    const newRows: DrawingRow[] = parsed.map((item, idx) => ({
-      id: `row-${idx + 1}`,
-      listNo: item.listNo,
-      drawingNo: item.drawingNo,
-      revision: item.revision,
-      title: item.title,
-      sourcePage: idx + startPageOffset,
-      isIncluded: true,
-      isManuallyEdited: false,
-      matchStatus: 'matched',
-      warnings: [],
-    }));
-
-    setRows(newRows);
-  };
-
-  // Extract from selectable-text PDF
-  const handleExtractFromPdf = async () => {
-    if (!selectedPdf) {
-      alert('Please select or upload a PDF first');
-      return;
-    }
-
-    try {
-      setIsProcessing(true);
-      const fileBytes = selectedPdf.data || new Uint8Array(await selectedPdf.file.arrayBuffer());
-      const pageTexts = await extractPdfPageTexts(fileBytes);
-
-      const parsed: DrawingRow[] = [];
-      let rowIdx = 1;
-
-      pageTexts.forEach((text, pageNum) => {
-        // Look for drawing number patterns like ABC-1234 or similar
-        const lines = text.split('\n');
-        lines.forEach((line) => {
-          const match = line.match(/([A-Z0-9\-_]{5,35})\s+([A-Z0-9]{1,3})/);
-          if (match) {
-            parsed.push({
-              id: `row-${rowIdx++}`,
-              listNo: String(rowIdx),
-              drawingNo: match[1],
-              revision: match[2],
-              title: line.replace(match[0], '').trim(),
-              sourcePage: pageNum + 1,
-              isIncluded: true,
-              isManuallyEdited: false,
-              matchStatus: 'matched',
-              warnings: [],
-            });
-          }
-        });
-      });
-
-      if (parsed.length > 0) {
-        setRows(parsed);
-      } else {
-        alert(
-          'No tabular drawing numbers detected from text. You can use the Paste Table or Upload Excel tab to import your list.'
-        );
-      }
-    } catch (err: any) {
-      alert(`Failed to extract text from PDF: ${err.message}`);
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
-  // Local OCR via Tesseract.js (or fallback to manual table)
-  const handleRunOcr = async () => {
-    if (!selectedPdf) {
-      alert('Please select a PDF first');
-      return;
-    }
-    setOcrLoading(true);
-    try {
-      const { createWorker } = await import('tesseract.js');
-      const worker = await createWorker('eng');
-      
-      const fileBytes = selectedPdf.data || new Uint8Array(await selectedPdf.file.arrayBuffer());
-      const canvas = await renderPageToCanvas(fileBytes, 1, 1.5);
-      
-      const ret = await worker.recognize(canvas);
-      await worker.terminate();
-
-      if (ret.data.text) {
-        const parsed = parseDelimitedText(ret.data.text);
-        if (parsed.length > 0) {
-          const newRows: DrawingRow[] = parsed.map((item, idx) => ({
-            id: `row-${idx + 1}`,
-            listNo: item.listNo,
-            drawingNo: item.drawingNo,
-            revision: item.revision,
-            title: item.title,
-            sourcePage: idx + startPageOffset,
-            isIncluded: true,
-            isManuallyEdited: false,
-            matchStatus: 'matched',
-            warnings: ['Parsed via client-side OCR; please review fields carefully'],
-          }));
-          setRows(newRows);
-        } else {
-          setPastedText(ret.data.text);
-          setActiveTab('paste');
-          alert('OCR extracted text! Review and edit the recognized table lines below.');
-        }
-      }
-    } catch (err: any) {
-      alert(`Client-side OCR notice: ${err.message}. You can paste your table directly in the Paste Table tab.`);
-    } finally {
-      setOcrLoading(false);
-    }
-  };
-
-  // Adjust start page offset (e.g. skip cover page)
-  const handleUpdateStartPage = (newOffset: number) => {
-    setStartPageOffset(newOffset);
-    setRows((prev) =>
-      prev.map((r, i) => {
-        // Only update non-manually adjusted rows
-        return {
-          ...r,
-          sourcePage: i + newOffset,
-        };
-      })
-    );
-  };
-
-  // Row update handlers
-  const handleToggleRow = (id: string) => {
-    setRows((prev) =>
-      prev.map((r) => (r.id === id ? { ...r, isIncluded: !r.isIncluded } : r))
-    );
-  };
-
-  const handleUpdateField = (id: string, field: keyof DrawingRow, val: any) => {
-    setRows((prev) =>
-      prev.map((r) => (r.id === id ? { ...r, [field]: val } : r))
-    );
-  };
-
-  const handleStartEditFilename = (row: DrawingRow) => {
-    setEditingRowId(row.id);
-    setEditFilenameVal(row.manualFilename || '');
-  };
-
-  const handleSaveEditFilename = (id: string) => {
-    const clean = sanitizeFilename(editFilenameVal);
-    setRows((prev) =>
-      prev.map((r) =>
-        r.id === id
-          ? {
-              ...r,
-              isManuallyEdited: true,
-              manualFilename: clean,
-            }
-          : r
-      )
-    );
-    setEditingRowId(null);
-  };
-
-  const handleResetManualName = (id: string) => {
-    setRows((prev) =>
-      prev.map((r) =>
-        r.id === id
-          ? {
-              ...r,
-              isManuallyEdited: false,
-              manualFilename: undefined,
-            }
-          : r
-      )
-    );
-  };
-
-  // Lazy thumbnail loader
-  const loadThumbnail = async (pageNum: number) => {
-    if (!selectedPdf || thumbnailCache[pageNum]) return;
-    try {
-      const fileBytes = selectedPdf.data || new Uint8Array(await selectedPdf.file.arrayBuffer());
-      const thumb = await renderPageThumbnail(fileBytes, pageNum, 200);
-      setThumbnailCache((prev) => ({ ...prev, [pageNum]: thumb }));
-    } catch {
-      // Ignore thumbnail rendering errors for large docs
-    }
+    setMode('drawing-list');
+    setShowImportPanel(false);
   };
 
   // Execution: Split and Save into Folder or ZIP
-  const handleSplitAndSave = async (mode: 'folder' | 'zip') => {
+  const handleSplitAndSave = async (exportMode: 'folder' | 'zip') => {
     if (!selectedPdf) {
-      alert('Please select a combined drawing PDF first');
-      return;
-    }
-    const includedRows = evaluatedRows.filter((r) => r.isIncluded);
-    if (includedRows.length === 0) {
-      alert('No rows selected for export.');
+      alert('Please select a combined drawing PDF first.');
       return;
     }
 
-    const outputFilenames = includedRows.map((row, index) =>
-      sanitizeFilename(row.manualFilename || `drawing_${index + 1}.pdf`)
-    );
-    const filenameCounts = new Map<string, number>();
-    outputFilenames.forEach((filename) => {
-      const key = filename.toLocaleLowerCase();
-      filenameCounts.set(key, (filenameCounts.get(key) || 0) + 1);
-    });
-    const duplicateNames = [...filenameCounts.entries()].filter(([, count]) => count > 1).map(([name]) => name);
-    if (counters.duplicates > 0 || duplicateNames.length > 0) {
-      alert(
-        `Export stopped: duplicate filenames were detected${duplicateNames.length ? ` (${duplicateNames.join(', ')})` : ''}. Resolve the duplicate names in the drawing list first; otherwise one drawing could overwrite another in the selected folder or collide when the ZIP is extracted on Windows.`
-      );
+    if (totalPdfPages === 0) {
+      alert('The selected PDF has no readable pages. Please check the document.');
       return;
     }
+
+    // Comprehensive validation before export
+    const validation = validateRowsForExport(rows, totalPdfPages, mode, pattern);
+    if (!validation.isValid) {
+      alert(validation.errorMessage || 'Export blocked due to validation errors.');
+      // Focus the first missing row if any
+      if (validation.missingPages.length > 0) {
+        const firstMissing = validation.missingPages[0];
+        const missingRow = rows.find((r) => r.sourcePage === firstMissing);
+        if (missingRow && inputRefs.current[missingRow.id]) {
+          inputRefs.current[missingRow.id]?.focus();
+          inputRefs.current[missingRow.id]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }
+      return;
+    }
+
+    const includedRows = evaluatedRows.filter((r) => r.isIncluded);
+    const outputFilenames = includedRows.map((row) => {
+      if (mode === 'manual' || row.isManuallyEdited) {
+        return cleanOutputFilename(row.manualFilename);
+      }
+      return buildFilename(row, pattern).filename;
+    });
 
     setIsProcessing(true);
     setProgress({ current: 0, total: includedRows.length, status: 'Preparing documents...' });
@@ -437,7 +478,8 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
 
     try {
       const fileBytes = selectedPdf.data || new Uint8Array(await selectedPdf.file.arrayBuffer());
-      if (mode === 'folder' && 'showDirectoryPicker' in window) {
+
+      if (exportMode === 'folder' && 'showDirectoryPicker' in window) {
         let dirHandle: any = null;
         try {
           dirHandle = await (window as any).showDirectoryPicker({
@@ -446,13 +488,12 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
         } catch (err: any) {
           if (err.name === 'AbortError') {
             setIsProcessing(false);
-            return; // Safe cancellation, do nothing
+            return;
           }
-          console.warn('showDirectoryPicker unavailable or cancelled, falling back to ZIP');
+          console.warn('Directory picker unavailable or dismissed, falling back to ZIP');
         }
 
         if (dirHandle) {
-          // Check for existing files before writing; never overwrite a previous export silently.
           const requestedNames = [...new Set([...outputFilenames, 'manifest.csv'])];
           const existingNames: string[] = [];
           for (const filename of requestedNames) {
@@ -463,11 +504,15 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
               if (lookupError?.name !== 'NotFoundError') throw lookupError;
             }
           }
-          if (existingNames.length > 0 && !confirm(`These files already exist in the selected folder:\n\n${existingNames.join('\n')}\n\nReplace them?`)) {
+          if (
+            existingNames.length > 0 &&
+            !confirm(`These files already exist in the selected folder:\n\n${existingNames.join('\n')}\n\nReplace them?`)
+          ) {
+            setIsProcessing(false);
             return;
           }
 
-          // Write directly into chosen folder
+          // Write files directly into chosen directory
           for (let i = 0; i < includedRows.length; i++) {
             const row = includedRows[i];
             const filename = outputFilenames[i];
@@ -496,7 +541,9 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
           await mWritable.write(manifestContent);
           await mWritable.close();
 
-          alert(`Successfully saved ${executionResults.filter((r) => r.status === 'success').length} drawings to folder!`);
+          alert(
+            `Successfully saved ${executionResults.filter((r) => r.status === 'success').length} files and manifest.csv to your chosen folder!`
+          );
           setIsProcessing(false);
           return;
         }
@@ -529,7 +576,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
       setProgress({
         current: includedRows.length,
         total: includedRows.length,
-        status: 'Compressing ZIP package...',
+        status: 'Compressing ZIP archive...',
       });
 
       const zipBlob = await zip.generateAsync({ type: 'blob' });
@@ -542,7 +589,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
     }
   };
 
-  // Filtered rows for search
+  // Filtered rows for search query
   const filteredRows = useMemo(() => {
     if (!searchQuery.trim()) return evaluatedRows;
     const q = searchQuery.toLowerCase();
@@ -555,40 +602,72 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
     );
   }, [evaluatedRows, searchQuery]);
 
+  // Preview page helper
+  const handlePreviewPage = (sourcePage: number) => {
+    if (!selectedPdf) return;
+    if (selectedPdf.data) {
+      onPreviewPdfPage?.(selectedPdf.data, sourcePage, `${selectedPdf.name} - Page ${sourcePage}`);
+    } else {
+      selectedPdf.file.arrayBuffer().then((b) => {
+        onPreviewPdfPage?.(new Uint8Array(b), sourcePage, `${selectedPdf.name} - Page ${sourcePage}`);
+      });
+    }
+  };
+
   return (
     <div className="space-y-6">
-      {/* Top Banner & Quick Controls */}
-      <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-5 shadow-sm backdrop-blur-xs">
+      {/* Top Banner & Mode Controls */}
+      <div className="rounded-2xl border border-slate-800/80 bg-slate-900/50 p-5 shadow-sm backdrop-blur-md">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-start gap-3">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-orange-500/10 border border-orange-500/20 text-orange-500">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400">
               <Scissors className="h-5 w-5" />
             </div>
             <div>
               <div className="flex items-center gap-2">
                 <h3 className="text-sm font-semibold text-white">
-                  Split & Rename Engineering Drawings
+                  Split & Rename PDF Pages
                 </h3>
-                <span className="rounded-full bg-orange-500/10 px-2 py-0.5 text-[10px] font-bold text-orange-400 border border-orange-500/20">
-                  Priority Tool
+                <span className="text-xs text-amber-400/90 font-medium">
+                  {mode === 'manual' ? 'Manual filename entry · default' : 'Drawing-list mode'}
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
-                Automatically split combined multi-page drawing packages into individual single-page PDFs named according to your drawing list.
+                {mode === 'manual'
+                  ? 'Enter output filenames directly for each page. Importing an engineering drawing list is completely optional.'
+                  : 'Pages are automatically mapped and named according to your imported drawing list template.'}
               </p>
             </div>
           </div>
 
-          <button
-            onClick={handleLoadSample}
-            className="inline-flex items-center gap-2 rounded-xl border border-orange-500/30 bg-orange-500/10 hover:bg-orange-500/20 px-3.5 py-2 text-xs font-semibold text-orange-400 transition"
-          >
-            <Sparkles className="w-3.5 h-3.5" />
-            <span>Load Sample Package (21 Drawings)</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2.5">
+            {mode === 'drawing-list' ? (
+              <button
+                onClick={handleSwitchToManual}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800/80 hover:bg-slate-700 px-3 py-2 text-xs font-medium text-slate-200 transition"
+                title="Return to manual per-page filename entry"
+              >
+                <RotateCcw className="w-3.5 h-3.5 text-amber-400" />
+                <span>Switch to Manual Filenames</span>
+              </button>
+            ) : (
+              <button
+                onClick={() => setShowImportPanel((prev) => !prev)}
+                className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition ${
+                  showImportPanel
+                    ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                    : 'border-slate-800 bg-slate-800/60 hover:bg-slate-800 hover:border-slate-700 text-slate-300'
+                }`}
+              >
+                <FileSpreadsheet className="w-3.5 h-3.5 text-amber-400" />
+                <span>Import Drawing List (Optional)</span>
+                {showImportPanel ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+              </button>
+            )}
+          </div>
         </div>
 
-        {/* Selected PDF summary */}
+        {/* Selected PDF Target Row */}
         <div className="mt-4 pt-4 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
           <div className="flex items-center gap-2">
             <span className="text-slate-400">Target PDF:</span>
@@ -596,7 +675,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
               <select
                 value={selectedPdfId}
                 onChange={(e) => setSelectedPdfId(e.target.value)}
-                className="rounded-lg border border-slate-700 bg-slate-800 px-2.5 py-1 text-xs text-white focus:outline-none focus:ring-1 focus:ring-orange-500"
+                className="rounded-lg border border-slate-700 bg-slate-800 px-2.5 py-1 text-xs text-white focus:outline-none focus:ring-1 focus:ring-amber-500"
               >
                 {pdfFiles.map((pdf) => (
                   <option key={pdf.id} value={pdf.id}>
@@ -614,152 +693,166 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
           {selectedPdf && (
             <div className="flex items-center gap-3 text-slate-400 text-[11px]">
               <span>
-                Total PDF Pages:{' '}
-                <strong className="text-slate-200">{totalPdfPages}</strong>
+                Total PDF Pages: <strong className="text-slate-200">{totalPdfPages}</strong>
               </span>
-              <span>•</span>
+              <span aria-hidden="true">·</span>
               <span>
-                Package File: <strong className="text-slate-200">{selectedPdf.name}</strong>
+                Document: <strong className="text-slate-200">{selectedPdf.name}</strong>
               </span>
             </div>
           )}
         </div>
       </div>
 
-      {/* Step 1: Import Drawing List */}
-      <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 shadow-sm">
-        <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3 flex items-center gap-2">
-          <span>1. Import Drawing List</span>
-          <span className="text-slate-500">•</span>
-          <span className="text-[11px] font-normal text-slate-400">
-            Provide the drawing list from Excel, CSV, PDF text, or copy-paste
-          </span>
-        </h4>
+      {/* Optional Import Drawing List Shortcuts Drawer */}
+      {showImportPanel && (
+        <div className="rounded-2xl border border-slate-800/90 bg-slate-900/60 p-5 shadow-sm space-y-4">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+            <div>
+              <h4 className="text-xs font-semibold text-slate-200">
+                Optional: Import Drawing List
+              </h4>
+              <p className="text-[11px] text-slate-400 mt-0.5">
+                Quickly import table rows from Excel, CSV, clipboard, or PDF text. If parsing fails, your manual table stays untouched.
+              </p>
+            </div>
 
-        {/* Tab Switcher */}
-        <div className="flex items-center gap-2 border-b border-slate-800 pb-3 mb-4">
-          <button
-            onClick={() => setActiveTab('upload')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'upload'
-                ? 'bg-orange-500 text-white'
-                : 'text-slate-400 hover:text-white hover:bg-slate-800'
-            }`}
-          >
-            <FileSpreadsheet className="w-3.5 h-3.5" />
-            <span>Excel / CSV File</span>
-          </button>
-          <button
-            onClick={() => setActiveTab('paste')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'paste'
-                ? 'bg-orange-500 text-white'
-                : 'text-slate-400 hover:text-white hover:bg-slate-800'
-            }`}
-          >
-            <Clipboard className="w-3.5 h-3.5" />
-            <span>Paste Table</span>
-          </button>
-          <button
-            onClick={() => setActiveTab('pdf-extract')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'pdf-extract'
-                ? 'bg-orange-500 text-white'
-                : 'text-slate-400 hover:text-white hover:bg-slate-800'
-            }`}
-          >
-            <FileText className="w-3.5 h-3.5" />
-            <span>Extract from PDF Text</span>
-          </button>
-          <button
-            onClick={() => setActiveTab('ocr')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'ocr'
-                ? 'bg-orange-500 text-white'
-                : 'text-slate-400 hover:text-white hover:bg-slate-800'
-            }`}
-          >
-            <ScanText className="w-3.5 h-3.5" />
-            <span>Local OCR</span>
-          </button>
-        </div>
-
-        {/* Tab contents */}
-        {activeTab === 'upload' && (
-          <div className="flex flex-col sm:flex-row items-center gap-4 rounded-xl border border-dashed border-slate-800 bg-slate-950/40 p-4">
-            <input
-              type="file"
-              accept=".xlsx,.xls,.csv"
-              onChange={handleFileUpload}
-              className="text-xs text-slate-400 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-orange-600 file:text-white hover:file:bg-orange-500 cursor-pointer"
-            />
-            <p className="text-[11px] text-slate-400">
-              Upload an Excel (.xlsx, .xls) or CSV file with columns: <strong>NO.</strong>, <strong>DRAWING NO.</strong>, <strong>REV.</strong>, <strong>TITLE</strong>.
-            </p>
-          </div>
-        )}
-
-        {activeTab === 'paste' && (
-          <div className="space-y-3">
-            <textarea
-              value={pastedText}
-              onChange={(e) => setPastedText(e.target.value)}
-              placeholder="Paste rows copied from Excel or CSV here (tab-separated or comma-separated)...&#10;Example:&#10;01	CR115-SKSPL-8720	A	General Arrangement&#10;02	CR115-SKSPL-8721	A	Lower Ground Plan"
-              rows={4}
-              className="w-full rounded-xl border border-slate-800 bg-slate-950 p-3 font-mono text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-orange-500"
-            />
             <button
-              onClick={handleApplyPastedText}
-              disabled={!pastedText.trim()}
-              className="rounded-lg bg-orange-600 hover:bg-orange-500 disabled:opacity-40 text-white px-3.5 py-1.5 text-xs font-medium transition"
+              onClick={handleLoadSample}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700/80 bg-slate-800/50 hover:bg-slate-800 px-2.5 py-1 text-[11px] font-medium text-slate-300 transition"
+              title="Load standard 21-drawing test package"
             >
-              Parse Pasted Rows
+              <span>Load Sample Package (21 items)</span>
             </button>
           </div>
-        )}
 
-        {activeTab === 'pdf-extract' && (
-          <div className="space-y-2">
-            <p className="text-xs text-slate-400">
-              Extract selectable text directly from the current PDF to detect drawing numbers and revisions without leaving the browser.
-            </p>
+          {/* Import Tabs */}
+          <div className="flex items-center gap-2">
             <button
-              onClick={handleExtractFromPdf}
-              disabled={!selectedPdf || isProcessing}
-              className="inline-flex items-center gap-2 rounded-lg bg-orange-600 hover:bg-orange-500 disabled:opacity-40 text-white px-4 py-2 text-xs font-medium transition"
+              onClick={() => setActiveImportTab('upload')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+                activeImportTab === 'upload'
+                  ? 'bg-amber-600 text-white'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              }`}
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5" />
+              <span>Excel / CSV File</span>
+            </button>
+            <button
+              onClick={() => setActiveImportTab('paste')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+                activeImportTab === 'paste'
+                  ? 'bg-amber-600 text-white'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              }`}
+            >
+              <Clipboard className="w-3.5 h-3.5" />
+              <span>Paste Table</span>
+            </button>
+            <button
+              onClick={() => setActiveImportTab('pdf-extract')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+                activeImportTab === 'pdf-extract'
+                  ? 'bg-amber-600 text-white'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              }`}
             >
               <FileText className="w-3.5 h-3.5" />
-              <span>Scan PDF Pages for Drawing Numbers</span>
+              <span>Extract from PDF Text</span>
             </button>
-          </div>
-        )}
-
-        {activeTab === 'ocr' && (
-          <div className="space-y-2">
-            <p className="text-xs text-slate-400">
-              Run OCR locally in your browser on scanned drawing index sheets. First use needs internet to download OCR assets; after they are cached, OCR may work offline on this device.
-            </p>
             <button
-              onClick={handleRunOcr}
-              disabled={ocrLoading || !selectedPdf}
-              className="inline-flex items-center gap-2 rounded-lg bg-orange-600 hover:bg-orange-500 disabled:opacity-40 text-white px-4 py-2 text-xs font-medium transition"
+              onClick={() => setActiveImportTab('ocr')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+                activeImportTab === 'ocr'
+                  ? 'bg-amber-600 text-white'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              }`}
             >
-              {ocrLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanText className="w-3.5 h-3.5" />}
-              <span>{ocrLoading ? 'Recognizing Page 1...' : 'Run Local OCR on Page 1'}</span>
+              <ScanText className="w-3.5 h-3.5" />
+              <span>Local OCR</span>
             </button>
           </div>
-        )}
-      </div>
 
-      {/* Step 2: Filename Rules & Page Offsets */}
-      {rows.length > 0 && (
+          {/* Tab contents */}
+          {activeImportTab === 'upload' && (
+            <div className="flex flex-col sm:flex-row items-center gap-4 rounded-xl border border-dashed border-slate-800 bg-slate-950/40 p-4">
+              <input
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                onChange={handleFileUpload}
+                className="text-xs text-slate-400 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-amber-600 file:text-white hover:file:bg-amber-500 cursor-pointer"
+              />
+              <p className="text-[11px] text-slate-400">
+                Upload an Excel (.xlsx, .xls) or CSV file with columns: <strong>NO.</strong>, <strong>DRAWING NO.</strong>, <strong>REV.</strong>, <strong>TITLE</strong>.
+              </p>
+            </div>
+          )}
+
+          {activeImportTab === 'paste' && (
+            <div className="space-y-3">
+              <textarea
+                value={pastedText}
+                onChange={(e) => setPastedText(e.target.value)}
+                placeholder="Paste rows copied from Excel or CSV here (tab-separated or comma-separated)...&#10;Example:&#10;01	CR115-SKSPL-8720	A	General Arrangement&#10;02	CR115-SKSPL-8721	A	Lower Ground Plan"
+                rows={4}
+                className="w-full rounded-xl border border-slate-800 bg-slate-950 p-3 font-mono text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-amber-500"
+              />
+              <button
+                onClick={handleApplyPastedText}
+                disabled={!pastedText.trim()}
+                className="rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white px-3.5 py-1.5 text-xs font-medium transition"
+              >
+                Parse Pasted Rows
+              </button>
+            </div>
+          )}
+
+          {activeImportTab === 'pdf-extract' && (
+            <div className="space-y-2">
+              <p className="text-xs text-slate-400">
+                Extract selectable text directly from the current PDF to detect drawing numbers and revisions without leaving the browser.
+              </p>
+              <button
+                onClick={handleExtractFromPdf}
+                disabled={!selectedPdf || isProcessing}
+                className="inline-flex items-center gap-2 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white px-4 py-2 text-xs font-medium transition"
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span>Scan PDF Pages for Drawing Numbers</span>
+              </button>
+            </div>
+          )}
+
+          {activeImportTab === 'ocr' && (
+            <div className="space-y-2">
+              <p className="text-xs text-slate-400">
+                Run optical character recognition on scanned drawing index sheets.
+              </p>
+              <button
+                onClick={handleRunOcr}
+                disabled={ocrLoading || !selectedPdf}
+                className="inline-flex items-center gap-2 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white px-4 py-2 text-xs font-medium transition"
+              >
+                {ocrLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanText className="w-3.5 h-3.5" />}
+                <span>{ocrLoading ? 'Recognizing Page 1...' : 'Run Local OCR on Page 1'}</span>
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Pattern Template Settings (Only in Drawing-List Mode) */}
+      {mode === 'drawing-list' && rows.length > 0 && (
         <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 shadow-sm space-y-4">
-          <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center justify-between">
-            <span>2. Filename Pattern & Page Mapping</span>
-            <span className="text-[11px] font-normal text-slate-400">
-              Default: <code className="text-orange-400 font-mono">{'{list_no} {drawing_no}{revision}.pdf'}</code>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+              Drawing-List Filename Pattern & Mapping
+            </h4>
+            <span className="text-[11px] text-slate-400 font-mono">
+              Pattern: <code className="text-amber-400">{pattern}</code>
             </span>
-          </h4>
+          </div>
 
           {/* Pattern Presets */}
           <div className="flex flex-wrap items-center gap-2">
@@ -770,7 +863,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
                 onClick={() => setPattern(p.value)}
                 className={`rounded-lg px-2.5 py-1 text-xs font-mono transition ${
                   pattern === p.value
-                    ? 'bg-orange-500 text-white font-semibold'
+                    ? 'bg-amber-600 text-white font-semibold'
                     : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
                 }`}
               >
@@ -789,7 +882,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
                 type="text"
                 value={pattern}
                 onChange={(e) => setPattern(e.target.value)}
-                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-mono text-white focus:outline-none focus:ring-1 focus:ring-orange-500"
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-mono text-white focus:outline-none focus:ring-1 focus:ring-amber-500"
               />
             </div>
 
@@ -804,7 +897,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
                   max={totalPdfPages || 999}
                   value={startPageOffset}
                   onChange={(e) => handleUpdateStartPage(Math.max(1, parseInt(e.target.value) || 1))}
-                  className="w-24 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white focus:outline-none focus:ring-1 focus:ring-orange-500"
+                  className="w-24 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white focus:outline-none focus:ring-1 focus:ring-amber-500"
                 />
                 <span className="text-[11px] text-slate-400">
                   {startPageOffset > 1 ? `Skips first ${startPageOffset - 1} pages` : 'Starts on Page 1'}
@@ -812,61 +905,59 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
               </div>
             </div>
           </div>
-
-          {/* Sample live preview */}
-          {rows[0] && (
-            <div className="rounded-xl bg-slate-950/60 p-3 border border-slate-800/80 flex items-center justify-between text-xs">
-              <div className="flex items-center gap-2">
-                <span className="text-slate-400">Row 1 Generated Name:</span>
-                <strong className="font-mono text-orange-400">
-                  {evaluatedRows[0]?.manualFilename}
-                </strong>
-              </div>
-              <span className="text-[11px] text-slate-500">
-                Leading zero stripped from list no (01 → 1) • Revision appended with no separator
-              </span>
-            </div>
-          )}
         </div>
       )}
 
-      {/* Step 3: Review Table & Counters */}
-      {rows.length > 0 && (
+      {/* Main Table / Empty State */}
+      {!selectedPdf || totalPdfPages === 0 ? (
+        <div className="rounded-2xl border border-dashed border-slate-800 bg-slate-900/30 p-10 text-center space-y-3">
+          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-500/10 border border-amber-500/20 text-amber-400">
+            <Scissors className="h-6 w-6" />
+          </div>
+          <h4 className="text-sm font-semibold text-white">No PDF Document Loaded</h4>
+          <p className="mx-auto max-w-md text-xs text-slate-400">
+            Please add or select a multi-page drawing package PDF above. Once loaded, a page-by-page table with blank filename inputs will appear automatically.
+          </p>
+        </div>
+      ) : (
         <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 shadow-sm space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-              3. Review & Validate Drawing Mappings
-            </h4>
+            <div>
+              <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                {mode === 'manual' ? 'Page-by-Page Filename Table' : 'Review & Validate Drawing Mappings'}
+              </h4>
+              <p className="text-[11px] text-slate-400 mt-0.5">
+                {mode === 'manual'
+                  ? 'Each included row splits one single-page PDF named as entered. .pdf is appended automatically.'
+                  : 'Review drawing metadata, check proposed filenames, or edit filenames individually.'}
+              </p>
+            </div>
 
             {/* Search filter */}
             <div className="relative w-full sm:w-64">
               <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-500" />
               <input
                 type="text"
-                placeholder="Search drawings or titles..."
+                placeholder="Filter pages or filenames..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full rounded-xl border border-slate-700 bg-slate-950 pl-8 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-orange-500"
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 pl-8 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
               />
             </div>
           </div>
 
           {/* Counters Bar */}
-          <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 text-center text-xs">
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-center text-xs">
             <div className="rounded-xl bg-slate-950/60 p-2.5 border border-slate-800">
-              <div className="text-[10px] uppercase text-slate-400 font-medium">PDF Pages</div>
+              <div className="text-[10px] uppercase text-slate-400 font-medium">Source Pages</div>
               <div className="mt-0.5 text-base font-bold text-white">{counters.totalPages}</div>
             </div>
             <div className="rounded-xl bg-slate-950/60 p-2.5 border border-slate-800">
-              <div className="text-[10px] uppercase text-slate-400 font-medium">Drawing Rows</div>
-              <div className="mt-0.5 text-base font-bold text-white">{counters.totalRows}</div>
-            </div>
-            <div className="rounded-xl bg-slate-950/60 p-2.5 border border-slate-800">
-              <div className="text-[10px] uppercase text-emerald-400 font-medium">Matched</div>
+              <div className="text-[10px] uppercase text-emerald-400 font-medium">Included / Ready</div>
               <div className="mt-0.5 text-base font-bold text-emerald-400">{counters.matched}</div>
             </div>
             <div className="rounded-xl bg-slate-950/60 p-2.5 border border-slate-800">
-              <div className="text-[10px] uppercase text-slate-400 font-medium">Unmatched</div>
+              <div className="text-[10px] uppercase text-slate-400 font-medium">Excluded</div>
               <div className="mt-0.5 text-base font-bold text-slate-400">{counters.unmatched}</div>
             </div>
             <div className="rounded-xl bg-slate-950/60 p-2.5 border border-slate-800">
@@ -876,55 +967,180 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
               </div>
             </div>
             <div className="rounded-xl bg-slate-950/60 p-2.5 border border-slate-800">
-              <div className="text-[10px] uppercase text-red-400 font-medium">Invalid / Missing</div>
+              <div className="text-[10px] uppercase text-red-400 font-medium">Missing Names</div>
               <div className={`mt-0.5 text-base font-bold ${counters.invalid > 0 ? 'text-red-400' : 'text-slate-400'}`}>
                 {counters.invalid}
               </div>
             </div>
           </div>
 
-          {/* Warning banner if page count differs */}
-          {totalPdfPages > 0 && totalPdfPages !== counters.totalRows && (
-            <div className="flex items-start gap-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 p-3 text-xs text-amber-300">
-              <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400 mt-0.5" />
-              <div>
-                <strong>Page count mismatch:</strong> The PDF has {totalPdfPages} pages but there are {counters.totalRows} drawing list rows.
-                Review the page mappings below before generating files. Assignments are never shifted silently.
-              </div>
+          {/* Table: Manual Mode */}
+          {mode === 'manual' ? (
+            <div className="overflow-x-auto rounded-xl border border-slate-800">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-800 bg-slate-950/80 text-[11px] text-slate-400 uppercase font-semibold">
+                    <th className="py-2.5 px-3 w-10 text-center">
+                      <input
+                        type="checkbox"
+                        checked={evaluatedRows.length > 0 && evaluatedRows.every((r) => r.isIncluded)}
+                        onChange={(e) => handleSelectAll(e.target.checked)}
+                        className="rounded border-slate-700 bg-slate-800 text-amber-600 focus:ring-0"
+                        title="Include or exclude all pages"
+                      />
+                    </th>
+                    <th className="py-2.5 px-3 w-28">SOURCE PAGE</th>
+                    <th className="py-2.5 px-3 min-w-[340px]">OUTPUT FILENAME</th>
+                    <th className="py-2.5 px-3 w-36">STATUS</th>
+                    <th className="py-2.5 px-3 w-20 text-right">PREVIEW</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60 bg-slate-950/40">
+                  {filteredRows.map((row) => {
+                    const rawVal = row.manualFilename || '';
+                    const cleanedPreview = cleanOutputFilename(rawVal);
+                    const isReserved = isReservedFilename(rawVal) || isReservedFilename(cleanedPreview);
+                    const isBlank = !cleanedPreview;
+
+                    return (
+                      <tr
+                        key={row.id}
+                        className={`hover:bg-slate-900/60 transition-colors ${
+                          !row.isIncluded ? 'opacity-40 bg-slate-950/80' : ''
+                        }`}
+                      >
+                        {/* Checkbox */}
+                        <td className="py-2.5 px-3 text-center">
+                          <input
+                            type="checkbox"
+                            checked={row.isIncluded}
+                            onChange={() => handleToggleRow(row.id)}
+                            className="rounded border-slate-700 bg-slate-800 text-amber-600 focus:ring-0"
+                          />
+                        </td>
+
+                        {/* Source Page */}
+                        <td className="py-2.5 px-3">
+                          <div className="flex items-center gap-1.5 font-medium text-slate-200">
+                            <span>Page {row.sourcePage}</span>
+                            <span className="text-[11px] text-slate-500">/ {totalPdfPages}</span>
+                          </div>
+                        </td>
+
+                        {/* Output Filename Input & Live Preview */}
+                        <td className="py-2.5 px-3">
+                          <div className="space-y-1">
+                            <input
+                              ref={(el) => {
+                                inputRefs.current[row.id] = el;
+                              }}
+                              type="text"
+                              value={rawVal}
+                              onChange={(e) => handleUpdateFilename(row.id, e.target.value)}
+                              placeholder={`Enter filename for page ${row.sourcePage}`}
+                              disabled={!row.isIncluded}
+                              className={`w-full rounded-lg border px-3 py-1.5 text-xs font-mono transition focus:outline-none ${
+                                !row.isIncluded
+                                  ? 'bg-slate-900/50 border-slate-800/80 text-slate-500'
+                                  : isReserved
+                                  ? 'bg-red-950/30 border-red-500/60 text-red-200 focus:border-red-400'
+                                  : isBlank
+                                  ? 'bg-slate-900 border-slate-700/80 text-slate-100 placeholder-slate-600 focus:border-amber-500'
+                                  : 'bg-slate-900 border-slate-700 text-slate-100 focus:border-amber-500'
+                              }`}
+                            />
+                            {/* Sanitized Live Preview */}
+                            <div className="flex items-center gap-1.5 text-[11px]">
+                              {cleanedPreview ? (
+                                <div className="flex items-center gap-1 font-mono text-amber-400/90 truncate">
+                                  <ArrowRight className="w-3 h-3 shrink-0 text-slate-500" />
+                                  <span className="font-semibold truncate">{cleanedPreview}</span>
+                                </div>
+                              ) : row.isIncluded ? (
+                                <span className="text-slate-500 italic">
+                                  No filename entered (required for export)
+                                </span>
+                              ) : (
+                                <span className="text-slate-600 italic">Page excluded from export</span>
+                              )}
+                            </div>
+                          </div>
+                        </td>
+
+                        {/* Status */}
+                        <td className="py-2.5 px-3">
+                          {!row.isIncluded ? (
+                            <span className="text-[11px] text-slate-500">Excluded</span>
+                          ) : isReserved ? (
+                            <span
+                              className="inline-flex items-center gap-1 text-[11px] text-red-400 font-medium cursor-help"
+                              title="manifest.csv is reserved for the export manifest"
+                            >
+                              <AlertCircle className="w-3.5 h-3.5 shrink-0" /> Reserved name
+                            </span>
+                          ) : isBlank ? (
+                            <span
+                              className="inline-flex items-center gap-1 text-[11px] text-amber-400 cursor-help"
+                              title={`Please enter an output filename for page ${row.sourcePage}`}
+                            >
+                              <AlertCircle className="w-3.5 h-3.5 shrink-0" /> Missing filename
+                            </span>
+                          ) : row.warnings.some((w) => w.toLowerCase().includes('duplicate')) ? (
+                            <span
+                              className="inline-flex items-center gap-1 text-[11px] text-amber-400 font-medium cursor-help"
+                              title="Multiple pages share this output filename"
+                            >
+                              <AlertTriangle className="w-3.5 h-3.5 shrink-0" /> Duplicate name
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+                              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> Ready
+                            </span>
+                          )}
+                        </td>
+
+                        {/* Preview Action */}
+                        <td className="py-2.5 px-3 text-right">
+                          <button
+                            onClick={() => handlePreviewPage(row.sourcePage)}
+                            className="rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-amber-400 transition"
+                            title={`Preview source page ${row.sourcePage}`}
+                          >
+                            <Eye className="w-4 h-4" />
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
-          )}
-
-          {/* Table */}
-          <div className="overflow-x-auto rounded-xl border border-slate-800">
-            <table className="w-full text-left text-xs border-collapse">
-              <thead>
-                <tr className="border-b border-slate-800 bg-slate-950/80 text-[11px] text-slate-400 uppercase font-semibold">
-                  <th className="py-2.5 px-3 w-8">
-                    <input
-                      type="checkbox"
-                      checked={evaluatedRows.every((r) => r.isIncluded)}
-                      onChange={(e) => {
-                        const checked = e.target.checked;
-                        setRows((prev) => prev.map((r) => ({ ...r, isIncluded: checked })));
-                      }}
-                      className="rounded border-slate-700 bg-slate-800 text-orange-600 focus:ring-0"
-                    />
-                  </th>
-                  <th className="py-2.5 px-3 w-14">NO.</th>
-                  <th className="py-2.5 px-3 min-w-[200px]">DRAWING NO.</th>
-                  <th className="py-2.5 px-3 w-16">REV.</th>
-                  <th className="py-2.5 px-3 min-w-[180px]">DRAWING TITLE</th>
-                  <th className="py-2.5 px-3 w-28">SOURCE PAGE</th>
-                  <th className="py-2.5 px-3 w-24">STATUS</th>
-                  <th className="py-2.5 px-3 min-w-[250px]">PROPOSED FILENAME</th>
-                  <th className="py-2.5 px-3 w-16 text-right">ACTION</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60 bg-slate-950/40 font-mono">
-                {filteredRows.map((row) => {
-                  const isEditing = editingRowId === row.id;
-
-                  return (
+          ) : (
+            /* Table: Drawing-List Mode */
+            <div className="overflow-x-auto rounded-xl border border-slate-800">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-800 bg-slate-950/80 text-[11px] text-slate-400 uppercase font-semibold">
+                    <th className="py-2.5 px-3 w-8">
+                      <input
+                        type="checkbox"
+                        checked={evaluatedRows.every((r) => r.isIncluded)}
+                        onChange={(e) => handleSelectAll(e.target.checked)}
+                        className="rounded border-slate-700 bg-slate-800 text-amber-600 focus:ring-0"
+                      />
+                    </th>
+                    <th className="py-2.5 px-3 w-14">NO.</th>
+                    <th className="py-2.5 px-3 min-w-[200px]">DRAWING NO.</th>
+                    <th className="py-2.5 px-3 w-16">REV.</th>
+                    <th className="py-2.5 px-3 min-w-[180px]">DRAWING TITLE</th>
+                    <th className="py-2.5 px-3 w-28">SOURCE PAGE</th>
+                    <th className="py-2.5 px-3 w-24">STATUS</th>
+                    <th className="py-2.5 px-3 min-w-[250px]">PROPOSED FILENAME</th>
+                    <th className="py-2.5 px-3 w-16 text-right">ACTION</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60 bg-slate-950/40 font-mono">
+                  {filteredRows.map((row) => (
                     <tr
                       key={row.id}
                       className={`hover:bg-slate-900/60 transition-colors ${
@@ -937,7 +1153,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
                           type="checkbox"
                           checked={row.isIncluded}
                           onChange={() => handleToggleRow(row.id)}
-                          className="rounded border-slate-700 bg-slate-800 text-orange-600 focus:ring-0"
+                          className="rounded border-slate-700 bg-slate-800 text-amber-600 focus:ring-0"
                         />
                       </td>
 
@@ -947,7 +1163,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
                           type="text"
                           value={row.listNo}
                           onChange={(e) => handleUpdateField(row.id, 'listNo', e.target.value)}
-                          className="w-12 rounded bg-slate-900 px-1.5 py-1 text-slate-200 border border-slate-800 focus:outline-none focus:border-orange-500"
+                          className="w-12 rounded bg-slate-900 px-1.5 py-1 text-slate-200 border border-slate-800 focus:outline-none focus:border-amber-500"
                         />
                       </td>
 
@@ -957,7 +1173,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
                           type="text"
                           value={row.drawingNo}
                           onChange={(e) => handleUpdateField(row.id, 'drawingNo', e.target.value)}
-                          className="w-full rounded bg-slate-900 px-1.5 py-1 text-slate-200 border border-slate-800 focus:outline-none focus:border-orange-500 font-mono font-medium"
+                          className="w-full rounded bg-slate-900 px-1.5 py-1 text-slate-200 border border-slate-800 focus:outline-none focus:border-amber-500 font-mono font-medium"
                         />
                       </td>
 
@@ -967,7 +1183,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
                           type="text"
                           value={row.revision}
                           onChange={(e) => handleUpdateField(row.id, 'revision', e.target.value)}
-                          className="w-12 rounded bg-slate-900 px-1.5 py-1 text-slate-200 border border-slate-800 focus:outline-none focus:border-orange-500 font-bold text-center"
+                          className="w-12 rounded bg-slate-900 px-1.5 py-1 text-slate-200 border border-slate-800 focus:outline-none focus:border-amber-500 font-bold text-center"
                         />
                       </td>
 
@@ -977,7 +1193,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
                           type="text"
                           value={row.title}
                           onChange={(e) => handleUpdateField(row.id, 'title', e.target.value)}
-                          className="w-full rounded bg-slate-900 px-1.5 py-1 text-slate-300 border border-slate-800 focus:outline-none focus:border-orange-500 text-xs"
+                          className="w-full rounded bg-slate-900 px-1.5 py-1 text-slate-300 border border-slate-800 focus:outline-none focus:border-amber-500 text-xs"
                         />
                       </td>
 
@@ -995,7 +1211,7 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
                             className={`w-16 rounded px-1.5 py-1 text-center border focus:outline-none ${
                               totalPdfPages > 0 && (row.sourcePage < 1 || row.sourcePage > totalPdfPages)
                                 ? 'bg-red-500/20 border-red-500/50 text-red-300'
-                                : 'bg-slate-900 border-slate-800 text-slate-200 focus:border-orange-500'
+                                : 'bg-slate-900 border-slate-800 text-slate-200 focus:border-amber-500'
                             }`}
                           />
                           {totalPdfPages > 0 && (
@@ -1034,106 +1250,63 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
 
                       {/* Proposed Filename */}
                       <td className="py-2 px-3">
-                        {isEditing ? (
-                          <div className="flex items-center gap-1">
-                            <input
-                              type="text"
-                              value={editFilenameVal}
-                              onChange={(e) => setEditFilenameVal(e.target.value)}
-                              className="w-full rounded bg-slate-900 px-2 py-1 text-xs text-orange-400 border border-orange-500 font-mono"
-                            />
-                            <button
-                              onClick={() => handleSaveEditFilename(row.id)}
-                              className="rounded bg-orange-600 px-2 py-1 text-[10px] text-white hover:bg-orange-500"
-                            >
-                              Save
-                            </button>
+                        <div className="space-y-1">
+                          <input
+                            type="text"
+                            value={row.manualFilename || ''}
+                            onChange={(e) => handleUpdateFilename(row.id, e.target.value)}
+                            placeholder="Automatic pattern name"
+                            className="w-full rounded bg-slate-900 px-2 py-1 text-xs text-slate-200 border border-slate-800 focus:outline-none focus:border-amber-500 font-mono"
+                          />
+                          <div className="text-[10px] text-amber-400/90 truncate">
+                            → {cleanOutputFilename(row.manualFilename) || buildFilename(row, pattern).filename}
                           </div>
-                        ) : (
-                          <div className="flex items-center justify-between gap-1 group/fn">
-                            <span
-                              className={`truncate font-mono ${
-                                row.isManuallyEdited ? 'text-amber-300 font-semibold' : 'text-slate-200'
-                              }`}
-                              title={row.manualFilename}
-                            >
-                              {row.manualFilename}
-                            </span>
-                            <div className="flex items-center gap-1 opacity-0 group-hover/fn:opacity-100 transition-opacity">
-                              <button
-                                onClick={() => handleStartEditFilename(row)}
-                                className="p-1 text-slate-400 hover:text-white"
-                                title="Edit filename manually"
-                              >
-                                <Edit2 className="w-3 h-3" />
-                              </button>
-                              {row.isManuallyEdited && (
-                                <button
-                                  onClick={() => handleResetManualName(row.id)}
-                                  className="p-1 text-amber-400 hover:text-white"
-                                  title="Reset to automatic pattern"
-                                >
-                                  <RotateCcw className="w-3 h-3" />
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                        )}
+                        </div>
                       </td>
 
                       {/* Actions */}
                       <td className="py-2 px-3 text-right">
-                        {selectedPdf && (
-                          <button
-                            onClick={() => {
-                              if (selectedPdf.data) {
-                                onPreviewPdfPage?.(selectedPdf.data, row.sourcePage);
-                              } else {
-                                selectedPdf.file.arrayBuffer().then((b) => {
-                                  onPreviewPdfPage?.(new Uint8Array(b), row.sourcePage);
-                                });
-                              }
-                            }}
-                            className="rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-orange-400 transition"
-                            title={`Preview source page ${row.sourcePage}`}
-                          >
-                            <Eye className="w-3.5 h-3.5" />
-                          </button>
-                        )}
+                        <button
+                          onClick={() => handlePreviewPage(row.sourcePage)}
+                          className="rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-amber-400 transition"
+                          title={`Preview source page ${row.sourcePage}`}
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                        </button>
                       </td>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
 
           {/* Action Bar: Export Folder or ZIP */}
           <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-4 border-t border-slate-800">
             <div className="text-xs text-slate-400">
-              Generating <strong className="text-white">{counters.matched}</strong> single-page PDF files + <strong className="text-white">manifest.csv</strong>
+              Selected <strong className="text-white">{counters.matched}</strong> of{' '}
+              <strong className="text-white">{evaluatedRows.length}</strong> pages for export +{' '}
+              <strong className="text-white">manifest.csv</strong>
             </div>
 
             <div className="flex items-center gap-3">
-              {/* Directory Picker Button if supported */}
               {'showDirectoryPicker' in window && (
                 <button
                   disabled={isProcessing || counters.matched === 0}
                   onClick={() => handleSplitAndSave('folder')}
-                  className="inline-flex items-center gap-2 rounded-xl bg-orange-600 hover:bg-orange-500 active:bg-orange-700 disabled:opacity-40 text-white px-4 py-2 text-xs font-semibold shadow-md shadow-orange-600/20 transition"
+                  className="inline-flex items-center gap-2 rounded-xl bg-amber-600 hover:bg-amber-500 active:bg-amber-700 disabled:opacity-40 text-white px-4 py-2 text-xs font-semibold shadow-md shadow-amber-600/20 transition"
                 >
                   <FolderDown className="w-4 h-4" />
                   <span>Choose Output Folder & Split</span>
                 </button>
               )}
 
-              {/* ZIP Download Fallback */}
               <button
                 disabled={isProcessing || counters.matched === 0}
                 onClick={() => handleSplitAndSave('zip')}
                 className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800/90 hover:bg-slate-700 disabled:opacity-40 text-slate-200 px-4 py-2 text-xs font-medium transition"
               >
-                <Download className="w-4 h-4 text-orange-400" />
+                <Download className="w-4 h-4 text-amber-400" />
                 <span>Download as ZIP Archive</span>
               </button>
             </div>
@@ -1141,16 +1314,16 @@ export const SplitRenameTool: React.FC<SplitRenameToolProps> = ({
 
           {/* Progress state */}
           {isProcessing && (
-            <div className="rounded-xl bg-slate-950 p-4 border border-orange-500/30 space-y-2">
+            <div className="rounded-xl bg-slate-950 p-4 border border-amber-500/30 space-y-2">
               <div className="flex items-center justify-between text-xs">
                 <span className="text-slate-300 font-medium">{progress.status}</span>
-                <span className="text-orange-400 font-bold">
+                <span className="text-amber-400 font-bold">
                   {progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0}%
                 </span>
               </div>
               <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
                 <div
-                  className="h-full bg-orange-500 transition-all duration-200"
+                  className="h-full bg-amber-500 transition-all duration-200"
                   style={{
                     width: `${progress.total > 0 ? (progress.current / progress.total) * 100 : 0}%`,
                   }}

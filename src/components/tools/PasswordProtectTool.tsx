@@ -122,7 +122,7 @@ export const PasswordProtectTool: React.FC<PasswordProtectToolProps> = ({
               Password Protect PDF (AES-256)
             </h3>
             <p className="text-xs text-slate-400 mt-0.5">
-              Encrypt your PDF with standard-compliant AES-256 cryptography entirely inside your browser.
+              Encrypt your PDF with standard-compliant AES-256 cryptography.
             </p>
           </div>
 
@@ -145,15 +145,12 @@ export const PasswordProtectTool: React.FC<PasswordProtectToolProps> = ({
           </div>
         </div>
 
-        {/* Security Warning Notice */}
-        <div className="rounded-xl bg-orange-500/10 border border-orange-500/25 p-3.5 text-xs text-orange-300 flex items-start gap-2.5">
-          <ShieldAlert className="w-4 h-4 text-orange-400 shrink-0 mt-0.5" />
-          <div className="space-y-1">
-            <strong className="text-orange-200">Zero-Knowledge Offline Encryption:</strong>
-            <p className="text-[11px] text-slate-300 leading-relaxed">
-              Your password and documents never leave your browser. Because there is no central server or recovery backdoor, <strong>a forgotten password cannot be recovered by anyone</strong>. Be sure to record your password in a password manager.
-            </p>
-          </div>
+        {/* Security Notice */}
+        <div className="rounded-xl bg-amber-500/10 border border-amber-500/20 p-3 text-xs text-amber-200/90 flex items-center gap-2.5">
+          <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
+          <p className="text-[11px] text-slate-300 leading-relaxed">
+            Forgotten passwords cannot be recovered. Make sure to keep your password in a safe password manager.
+          </p>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

@@ -14,6 +14,23 @@ export const PATTERN_PRESETS = [
   { label: 'Page + Drawing + Rev', value: 'Page {page} - {drawing_no}{revision}' },
 ];
 
+export const RESERVED_FILENAMES = new Set(['manifest.csv']);
+
+/**
+ * Checks if a filename (typed by user or sanitized) collides with the reserved export manifest.
+ * Handles case-insensitivity and variations like 'manifest.csv.pdf'.
+ */
+export function isReservedFilename(filename: string | undefined | null): boolean {
+  if (!filename) return false;
+  const raw = filename.trim().toLowerCase();
+  if (raw === 'manifest.csv' || raw === 'manifest.csv.pdf') return true;
+  if (raw.endsWith('.pdf')) {
+    const withoutPdf = raw.slice(0, -4).trim();
+    if (withoutPdf === 'manifest.csv' || withoutPdf === 'manifest') return true;
+  }
+  return false;
+}
+
 /**
  * Strips leading zeros ONLY from the start of list numbers:
  * 01 -> 1
@@ -37,12 +54,45 @@ export function formatListNo(noStr: string | number | undefined | null): string 
 }
 
 /**
+ * Sanitizes user-entered filename for output.
+ * If user omits .pdf, automatically appends .pdf.
+ * Does NOT force default placeholder like 'unnamed.pdf' if empty.
+ * Returns empty string if input is blank or whitespace-only.
+ * Cleans Windows/Unix illegal characters: < > : " / \ | ? *
+ * Collapses multiple spaces and dashes.
+ * Trims leading/trailing whitespace, dots, and dashes.
+ */
+export function cleanOutputFilename(input: string | undefined | null): string {
+  if (!input || !input.trim()) return '';
+
+  let base = input.trim();
+  if (base.toLowerCase().endsWith('.pdf')) {
+    base = base.slice(0, -4);
+  }
+
+  // Replace illegal Windows & Unix characters: < > : " / \ | ? * and ASCII 0-31
+  base = base.replace(/[<>:"/\\|?*\x00-\x1F]/g, '-');
+
+  // Collapse multiple dashes/spaces and spaces around dashes
+  base = base.replace(/[\s\t]+/g, ' ');
+  base = base.replace(/\s*-\s*/g, '-');
+  base = base.replace(/-+/g, '-');
+
+  // Remove leading and trailing spaces, dashes, or dots
+  base = base.replace(/^[.\-\s]+|[.\-\s]+$/g, '').trim();
+
+  if (!base) return '';
+  return `${base}.pdf`;
+}
+
+/**
  * Sanitizes Windows & Unix illegal characters: < > : " / \ | ? *
  * Trims outer whitespace and trailing dots/spaces
- * Ensures valid .pdf extension
+ * Ensures valid .pdf extension.
+ * Defaults empty input to 'unnamed.pdf' for backward compatibility.
  */
-export function sanitizeFilename(filename: string): string {
-  if (!filename) return 'unnamed.pdf';
+export function sanitizeFilename(filename: string, fallback: string = 'unnamed'): string {
+  if (!filename) return `${fallback}.pdf`;
   
   // Strip .pdf from end if already present to work on basename
   let base = filename.trim();
@@ -51,7 +101,6 @@ export function sanitizeFilename(filename: string): string {
   }
   
   // Replace illegal characters with underscore or dash
-  // Illegal: < > : " / \ | ? * and ASCII 0-31
   base = base.replace(/[<>:"/\\|?*\x00-\x1F]/g, '-');
   
   // Collapse multiple dashes/spaces
@@ -62,7 +111,7 @@ export function sanitizeFilename(filename: string): string {
   base = base.replace(/^[.\-\s]+|[.\-\s]+$/g, '').trim();
   
   if (!base) {
-    base = 'drawing';
+    base = fallback;
   }
   
   return `${base}.pdf`;
@@ -80,7 +129,6 @@ export function checkRevisionAlreadyAppended(drawingNo: string, revision: string
   
   // Exact end match case-insensitive
   if (cleanDrawing.toLowerCase().endsWith(cleanRev.toLowerCase())) {
-    // Check if preceded by a letter, digit, or hyphen
     return true;
   }
   return false;
@@ -123,12 +171,38 @@ export function buildFilename(
 }
 
 /**
- * Updates filenames, match statuses, and detects duplicate/invalid names
+ * Generates one blank editable row for each page of the loaded PDF.
+ * Default manual mode starts with clean, empty filenames (no synthetic names).
+ */
+export function createManualRowsForPageCount(pageCount: number): DrawingRow[] {
+  if (pageCount <= 0) return [];
+  return Array.from({ length: pageCount }, (_, i) => {
+    const pageNum = i + 1;
+    return {
+      id: `manual-page-${pageNum}`,
+      listNo: String(pageNum),
+      drawingNo: '',
+      revision: '',
+      title: '',
+      sourcePage: pageNum,
+      isIncluded: true,
+      isManuallyEdited: true,
+      manualFilename: '',
+      matchStatus: 'warning',
+      warnings: [`Missing filename for page ${pageNum}`],
+    };
+  });
+}
+
+/**
+ * Evaluates drawing rows live against the given pattern and PDF page count.
+ * Supports both 'manual' mode and 'drawing-list' mode.
  */
 export function evaluateRows(
   rows: DrawingRow[],
   pattern: string,
-  totalPdfPages: number
+  totalPdfPages: number,
+  mode: 'manual' | 'drawing-list' = 'drawing-list'
 ): {
   rows: DrawingRow[];
   counters: {
@@ -138,33 +212,66 @@ export function evaluateRows(
     unmatched: number;
     duplicates: number;
     invalid: number;
+    missingNames: number;
   };
 } {
   const filenameCounts = new Map<string, number>();
 
-  // Pass 1: compute filename and basic validity
+  // Pass 1: compute output filename and basic validity for each row
   const processed = rows.map((row) => {
     let filename = '';
     const rowWarnings: string[] = [];
 
-    if (row.isManuallyEdited && row.manualFilename) {
-      filename = sanitizeFilename(row.manualFilename);
-      if (filename !== row.manualFilename) {
-        rowWarnings.push('Manual filename had invalid characters cleaned');
+    if (mode === 'manual') {
+      const raw = row.manualFilename || '';
+      const clean = cleanOutputFilename(raw);
+
+      if (isReservedFilename(raw) || isReservedFilename(clean)) {
+        rowWarnings.push('Reserved filename: "manifest.csv" is reserved for the export manifest');
+      }
+
+      if (clean) {
+        filename = clean;
+        if (raw.trim() && clean !== raw.trim() && !raw.trim().endsWith('.pdf')) {
+          // If cleaned changed characters other than just appending .pdf
+          if (clean !== `${raw.trim()}.pdf`) {
+            rowWarnings.push('Filename had invalid characters cleaned');
+          }
+        }
+      } else {
+        filename = '';
+        if (row.isIncluded) {
+          rowWarnings.push(`Missing filename for page ${row.sourcePage}`);
+        }
       }
     } else {
-      const generated = buildFilename(
-        {
-          listNo: row.listNo,
-          drawingNo: row.drawingNo,
-          revision: row.revision,
-          title: row.title,
-          sourcePage: row.sourcePage,
-        },
-        pattern
-      );
-      filename = generated.filename;
-      rowWarnings.push(...generated.warnings);
+      // Drawing list mode
+      if (row.isManuallyEdited && row.manualFilename) {
+        const clean = cleanOutputFilename(row.manualFilename);
+        if (isReservedFilename(row.manualFilename) || isReservedFilename(clean)) {
+          rowWarnings.push('Reserved filename: "manifest.csv" is reserved for the export manifest');
+        }
+        filename = clean;
+        if (filename && filename !== row.manualFilename) {
+          rowWarnings.push('Manual filename had invalid characters cleaned');
+        }
+      } else {
+        const generated = buildFilename(
+          {
+            listNo: row.listNo,
+            drawingNo: row.drawingNo,
+            revision: row.revision,
+            title: row.title,
+            sourcePage: row.sourcePage,
+          },
+          pattern
+        );
+        filename = generated.filename;
+        if (isReservedFilename(filename)) {
+          rowWarnings.push('Reserved filename: "manifest.csv" is reserved for the export manifest');
+        }
+        rowWarnings.push(...generated.warnings);
+      }
     }
 
     // Page match status check
@@ -178,40 +285,57 @@ export function evaluateRows(
       matchStatus = 'warning';
     }
 
-    if (row.isIncluded) {
-      const current = filenameCounts.get(filename) || 0;
-      filenameCounts.set(filename, current + 1);
+    // Case-insensitive duplicate tracking for included rows with non-empty filenames
+    if (row.isIncluded && filename) {
+      const key = filename.toLowerCase();
+      const current = filenameCounts.get(key) || 0;
+      filenameCounts.set(key, current + 1);
     }
 
     return {
       ...row,
-      manualFilename: row.isManuallyEdited ? row.manualFilename : filename,
+      manualFilename: mode === 'manual' ? (row.manualFilename ?? '') : (row.isManuallyEdited ? row.manualFilename : filename),
       matchStatus,
       warnings: rowWarnings,
+      _evaluatedFilename: filename,
     };
   });
 
-  // Pass 2: mark duplicates
+  // Pass 2: mark duplicates & tally counters
   let duplicateCount = 0;
   let invalidCount = 0;
+  let missingNamesCount = 0;
   let matchedCount = 0;
   let unmatchedCount = 0;
 
   const finalRows = processed.map((row) => {
     const rowWarnings = [...row.warnings];
-    const filename = row.isManuallyEdited && row.manualFilename ? row.manualFilename : row.manualFilename || '';
-    
+    const evaluatedName = row._evaluatedFilename || (mode === 'manual' ? cleanOutputFilename(row.manualFilename) : row.manualFilename || '');
+
     if (row.isIncluded) {
-      const count = filenameCounts.get(filename) || 0;
-      if (count > 1) {
-        duplicateCount++;
-        rowWarnings.push(`Duplicate filename: ${filename} is used by multiple rows`);
-      }
-      if (!filename || filename === '.pdf' || filename === 'unnamed.pdf') {
+      if (evaluatedName) {
+        const count = filenameCounts.get(evaluatedName.toLowerCase()) || 0;
+        if (count > 1) {
+          duplicateCount++;
+          rowWarnings.push(`Duplicate filename: ${evaluatedName} is used by multiple rows`);
+        }
+      } else {
+        missingNamesCount++;
         invalidCount++;
-        rowWarnings.push('Invalid or empty filename generated');
+        if (!rowWarnings.some((w) => w.includes('Missing filename'))) {
+          rowWarnings.push(`Missing filename for page ${row.sourcePage}`);
+        }
       }
-      if (row.matchStatus === 'matched') {
+
+      if (isReservedFilename(evaluatedName) || isReservedFilename(row.manualFilename)) {
+        invalidCount++;
+      }
+
+      if (totalPdfPages > 0 && (row.sourcePage < 1 || row.sourcePage > totalPdfPages)) {
+        invalidCount++;
+      }
+
+      if (row.matchStatus === 'matched' && rowWarnings.length === 0) {
         matchedCount++;
       } else {
         unmatchedCount++;
@@ -229,8 +353,9 @@ export function evaluateRows(
       ? 'warning'
       : 'matched';
 
+    const { _evaluatedFilename, ...cleanRow } = row as any;
     return {
-      ...row,
+      ...cleanRow,
       matchStatus: finalMatchStatus,
       warnings: rowWarnings,
     };
@@ -245,7 +370,136 @@ export function evaluateRows(
       unmatched: unmatchedCount,
       duplicates: duplicateCount,
       invalid: invalidCount,
+      missingNames: missingNamesCount,
     },
+  };
+}
+
+/**
+ * Validates rows before export and returns a clear, actionable blocker message if any issue exists.
+ */
+export function validateRowsForExport(
+  rows: DrawingRow[],
+  totalPdfPages: number,
+  mode: 'manual' | 'drawing-list' = 'manual',
+  pattern: string = DEFAULT_PATTERN
+): {
+  isValid: boolean;
+  errorMessage?: string;
+  missingPages: number[];
+  duplicateNames: string[];
+  reservedNames: string[];
+  outOfRangePages: number[];
+} {
+  const included = rows.filter((r) => r.isIncluded);
+  if (included.length === 0) {
+    return {
+      isValid: false,
+      errorMessage: 'No pages selected for export. Please select at least one page to export.',
+      missingPages: [],
+      duplicateNames: [],
+      reservedNames: [],
+      outOfRangePages: [],
+    };
+  }
+
+  const missingPages: number[] = [];
+  const reservedNames: string[] = [];
+  const outOfRangePages: number[] = [];
+  const resolvedFilenames: Array<{ row: DrawingRow; filename: string }> = [];
+
+  for (const row of included) {
+    // Validate source page number
+    if (totalPdfPages > 0 && (row.sourcePage < 1 || row.sourcePage > totalPdfPages)) {
+      outOfRangePages.push(row.sourcePage);
+    }
+
+    let fn = '';
+    if (mode === 'manual' || row.isManuallyEdited) {
+      const raw = (row.manualFilename || '').trim();
+      if (isReservedFilename(raw)) {
+        if (!reservedNames.includes(raw)) reservedNames.push(raw);
+      }
+      fn = cleanOutputFilename(raw);
+    } else {
+      const built = buildFilename(row, pattern);
+      fn = built.filename;
+    }
+
+    if (!fn) {
+      missingPages.push(row.sourcePage);
+    } else {
+      if (isReservedFilename(fn)) {
+        if (!reservedNames.includes(fn)) reservedNames.push(fn);
+      }
+      resolvedFilenames.push({ row, filename: fn });
+    }
+  }
+
+  // 1. Missing filenames check (blocks export)
+  if (missingPages.length > 0) {
+    return {
+      isValid: false,
+      errorMessage: `Export stopped: ${missingPages.length} included page(s) have no filename (Page ${missingPages.join(', ')}). Please enter a filename for all selected pages before exporting.`,
+      missingPages,
+      duplicateNames: [],
+      reservedNames,
+      outOfRangePages,
+    };
+  }
+
+  // 2. Reserved filename check (manifest.csv)
+  if (reservedNames.length > 0) {
+    return {
+      isValid: false,
+      errorMessage: `Export stopped: "manifest.csv" is reserved for the export manifest and cannot be used as a drawing filename.`,
+      missingPages: [],
+      duplicateNames: [],
+      reservedNames,
+      outOfRangePages,
+    };
+  }
+
+  // 3. Out-of-range source pages check
+  if (outOfRangePages.length > 0) {
+    return {
+      isValid: false,
+      errorMessage: `Export stopped: Page ${outOfRangePages.join(', ')} is outside the valid PDF page range (1-${totalPdfPages}).`,
+      missingPages: [],
+      duplicateNames: [],
+      reservedNames,
+      outOfRangePages,
+    };
+  }
+
+  // 4. Duplicate filenames check (case-insensitive)
+  const nameMap = new Map<string, number>();
+  resolvedFilenames.forEach(({ filename }) => {
+    const key = filename.toLowerCase();
+    nameMap.set(key, (nameMap.get(key) || 0) + 1);
+  });
+
+  const duplicateNames = [...nameMap.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([name]) => name);
+
+  if (duplicateNames.length > 0) {
+    return {
+      isValid: false,
+      errorMessage: `Export stopped: Duplicate filename(s) detected (${duplicateNames.join(', ')}). Each output file must have a unique name.`,
+      missingPages: [],
+      duplicateNames,
+      reservedNames,
+      outOfRangePages,
+    };
+  }
+
+  return {
+    isValid: true,
+    missingPages: [],
+    duplicateNames: [],
+    reservedNames: [],
+    outOfRangePages: [],
   };
 }
 
